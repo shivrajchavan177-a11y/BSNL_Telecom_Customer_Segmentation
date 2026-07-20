@@ -1,4 +1,4 @@
-import os
+import io
 import joblib
 import numpy as np
 import pandas as pd
@@ -6,422 +6,460 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.pipeline import Pipeline
+
 # ============================================================
 # Page Config
 # ============================================================
 st.set_page_config(
-    page_title="BSNL Customer Segmentation",
-    page_icon="📡",
+    page_title="Universal Customer Segmentation",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ============================================================
-# Constants — must match train_model.py exactly
-# ============================================================
-NUMERICAL_COLS = [
-    "SeniorCitizen",
-    "Tenure_Months",
-    "MonthlyCharges",
-    "TotalCharges"
+SEGMENT_COLORS = [
+    "#2E86AB", "#06A77D", "#D62839", "#9B5DE5",
+    "#F4A259", "#5DA9E9", "#E07A5F", "#43AA8B", "#8E44AD", "#118AB2"
 ]
 
-CATEGORICAL_COLS = [
-    "Gender",
-    "Partner",
-    "Dependents",
-    "PhoneService",
-    "InternetService",
-    "Contract",
-    "PaymentMethod",
-    "PaperlessBilling",
-    "StreamingTV",
-    "StreamingMovies",
-    "TechSupport",
-    "OnlineSecurity",
-    "OnlineBackup",
-    "DeviceProtection",
-    "MultipleLines"
-]
-
-REQUIRED_COLS = NUMERICAL_COLS + CATEGORICAL_COLS
-
-CLUSTER_MAP = {
-    0: "👑 Loyal High-Value Customers",
-    1: "🆕 New Customers",
-    2: "⚠️ At-Risk Customers",
-    3: "💎 Premium Service Users"
-}
-
-CLUSTER_COLORS = {
-    "👑 Loyal High-Value Customers": "#2E86AB",
-    "🆕 New Customers": "#06A77D",
-    "⚠️ At-Risk Customers": "#D62839",
-    "💎 Premium Service Users": "#9B5DE5"
-}
-
-MODEL_DIR = "model"
+SAMPLE_LIMIT_FOR_SILHOUETTE = 5000   # silhouette_score is O(n^2), keep it fast on big data
+SAMPLE_LIMIT_FOR_ELBOW = 3000        # elbow re-fits KMeans many times, sample harder
 
 
 # ============================================================
-# Load Model Artifacts (cached)
+# Helpers — Loading
 # ============================================================
-@st.cache_resource
-def load_artifacts():
-    preprocessor_path = os.path.join(MODEL_DIR, "preprocessor.pkl")
-    kmeans_path = os.path.join(MODEL_DIR, "kmeans_model.pkl")
-    sil_path = os.path.join(MODEL_DIR, "silhouette_score.pkl")
-
-    missing = [p for p in [preprocessor_path, kmeans_path, sil_path] if not os.path.exists(p)]
-    if missing:
-        return None, None, None, missing
-
-    preprocessor = joblib.load(preprocessor_path)
-    kmeans = joblib.load(kmeans_path)
-    sil_score = joblib.load(sil_path)
-    return preprocessor, kmeans, sil_score, []
-
-
-preprocessor, kmeans, sil_score, missing_files = load_artifacts()
-
-
-# ============================================================
-# Helper Functions
-# ============================================================
-def clean_column_names(df):
-    """Best-effort fix for common casing / spacing mismatches."""
-    rename_map = {}
-    lower_map = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
-    for target in REQUIRED_COLS:
-        key = target.lower().replace(" ", "").replace("_", "")
-        if key in lower_map and lower_map[key] != target:
-            rename_map[lower_map[key]] = target
-    return df.rename(columns=rename_map)
-
-
-def validate_columns(df):
-    missing_cols = [c for c in REQUIRED_COLS if c not in df.columns]
-    return missing_cols
-
-
-def predict_segments(df):
-    df = df.copy()
-    X = preprocessor.transform(df)
-    clusters = kmeans.predict(X)
-    df["Cluster"] = clusters
-    df["Customer Segment"] = df["Cluster"].map(CLUSTER_MAP)
-    return df
-
-
-@st.cache_data
-def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode("utf-8")
-
-
 def load_uploaded_file(uploaded_file):
-    if uploaded_file.name.lower().endswith(".csv"):
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
         return pd.read_csv(uploaded_file)
-    else:
-        return pd.read_excel(uploaded_file)
+    return pd.read_excel(uploaded_file)
+
+
+# ============================================================
+# Helpers — Auto profiling / cleaning
+# ============================================================
+def profile_dataframe(df):
+    """Decide numeric vs categorical vs excluded columns, and report why."""
+    n_rows = len(df)
+    numeric_cols, categorical_cols, excluded = [], [], []
+
+    for col in df.columns:
+        series = df[col]
+        nunique = series.nunique(dropna=True)
+
+        # Constant column
+        if nunique <= 1:
+            excluded.append((col, "constant value (no variation)"))
+            continue
+
+        # Datetime
+        if pd.api.types.is_datetime64_any_dtype(series):
+            excluded.append((col, "datetime column (not used for clustering)"))
+            continue
+
+        # ID-like: every row unique, or name suggests an identifier with high cardinality
+        looks_like_id = "id" in col.lower()
+        if nunique == n_rows or (looks_like_id and nunique > 0.5 * n_rows):
+            excluded.append((col, "looks like a unique identifier"))
+            continue
+
+        # Numeric
+        if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+            numeric_cols.append(col)
+            continue
+
+        # Categorical / boolean
+        if nunique <= 50:
+            categorical_cols.append(col)
+        else:
+            excluded.append((col, f"too many unique values ({nunique}) for one-hot encoding"))
+
+    return numeric_cols, categorical_cols, excluded
+
+
+def clean_dataframe(df, numeric_cols, categorical_cols):
+    """Impute missing values, report what was filled."""
+    df = df.copy()
+    fill_report = []
+
+    for col in numeric_cols:
+        n_missing = df[col].isna().sum()
+        if n_missing > 0:
+            median_val = df[col].median()
+            df[col] = df[col].fillna(median_val)
+            fill_report.append((col, n_missing, f"median ({median_val:.2f})"))
+
+    for col in categorical_cols:
+        n_missing = df[col].isna().sum()
+        if n_missing > 0:
+            mode_val = df[col].mode(dropna=True)
+            mode_val = mode_val.iloc[0] if len(mode_val) else "Unknown"
+            df[col] = df[col].fillna(mode_val)
+            fill_report.append((col, n_missing, f"most frequent value ('{mode_val}')"))
+
+    return df, fill_report
+
+
+def build_pipeline(numeric_cols, categorical_cols):
+    return ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), numeric_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols)
+        ]
+    )
+
+
+# ============================================================
+# Helpers — Clustering & Metrics
+# ============================================================
+def sample_for_metric(X, labels, limit):
+    n = X.shape[0]
+    if n <= limit:
+        return X, labels
+    rng = np.random.RandomState(42)
+    idx = rng.choice(n, size=limit, replace=False)
+    X_sampled = X[idx] if not hasattr(X, "toarray") else X[idx].toarray()
+    return X_sampled, labels[idx]
+
+
+def safe_silhouette(X, labels):
+    X_arr = X.toarray() if hasattr(X, "toarray") else X
+    X_s, labels_s = sample_for_metric(X_arr, labels, SAMPLE_LIMIT_FOR_SILHOUETTE)
+    was_sampled = X_s.shape[0] < X_arr.shape[0]
+    score = silhouette_score(X_s, labels_s)
+    return score, was_sampled, X_s.shape[0]
+
+
+@st.cache_data(show_spinner=False)
+def run_elbow_analysis(_X_hash, X_dense, k_range):
+    """X_dense must already be a small, dense sample."""
+    wcss, sil = [], []
+    for k in k_range:
+        km = KMeans(n_clusters=k, random_state=42, n_init=5)
+        labels = km.fit_predict(X_dense)
+        wcss.append(km.inertia_)
+        sil.append(silhouette_score(X_dense, labels))
+    return wcss, sil
+
+
+def run_clustering(X, k):
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(X)
+    return km, labels
+
+
+# ============================================================
+# Session State Helpers
+# ============================================================
+def reset_results():
+    for key in ["result_df", "km_model", "preprocessor", "silhouette", "sil_sampled",
+                "sil_n", "numeric_cols", "categorical_cols", "excluded_cols", "fill_report", "k_used"]:
+        st.session_state.pop(key, None)
 
 
 # ============================================================
 # Sidebar
 # ============================================================
 with st.sidebar:
-    st.title("📡 BSNL Segmentation")
-    st.markdown("Upload your customer data to generate segments and explore the dashboard.")
-
-    uploaded_file = st.file_uploader(
-        "Upload CSV or Excel file",
-        type=["csv", "xlsx", "xls"],
-        help="File must contain the same columns used during training."
+    st.title("📊 Universal Segmentation")
+    st.markdown(
+        "Upload **any** customer dataset. The app profiles it, cleans it, "
+        "and clusters it — no fixed schema, no pre-trained model."
     )
 
-    st.markdown("---")
-    st.markdown("**Expected columns**")
-    with st.expander("Numerical columns"):
-        st.write(NUMERICAL_COLS)
-    with st.expander("Categorical columns"):
-        st.write(CATEGORICAL_COLS)
+    uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
+
+    # Detect new file -> clear previous results
+    if uploaded_file is not None:
+        file_signature = (uploaded_file.name, uploaded_file.size)
+        if st.session_state.get("file_signature") != file_signature:
+            st.session_state["file_signature"] = file_signature
+            reset_results()
 
     st.markdown("---")
-    if sil_score is not None:
-        st.metric("Model Silhouette Score", f"{sil_score:.3f}")
-    st.caption("Built with KMeans clustering (k=4)")
-
-
-# ============================================================
-# Guard: Missing model artifacts
-# ============================================================
-if missing_files:
-    st.error(
-        "⚠️ Model files not found. Please make sure the following files are present "
-        f"in the `model/` folder alongside `app.py`:\n\n" +
-        "\n".join(f"- `{m}`" for m in missing_files) +
-        "\n\nRun `train_model.py` first to generate them."
+    st.markdown("**How this works**")
+    st.caption(
+        "1. Detects numeric vs categorical columns automatically\n\n"
+        "2. Cleans missing values and drops ID-like columns\n\n"
+        "3. Scales numeric features, one-hot encodes categorical ones\n\n"
+        "4. Runs KMeans with the K you choose\n\n"
+        "5. Reports a silhouette score computed fresh for *this* run"
     )
-    st.stop()
 
 
 # ============================================================
-# Main Header
+# Main — No file uploaded
 # ============================================================
-st.title("📡 BSNL Customer Segmentation Dashboard")
+st.title("📊 Universal Customer Segmentation Dashboard")
 st.markdown(
-    "An interactive dashboard for exploring customer segments derived from "
-    "KMeans clustering on telecom subscription and billing data."
+    "Drop in a dataset — telecom, retail, banking, anything with customer-level rows — "
+    "and this dashboard will clean it, help you pick the right number of segments, "
+    "and cluster it live."
 )
 
-# ============================================================
-# No file uploaded yet
-# ============================================================
 if uploaded_file is None:
     st.info("👈 Upload a CSV or Excel file from the sidebar to get started.")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("### 👑 Loyal High-Value")
-        st.caption("Long tenure, high spend, low churn risk.")
-    with col2:
-        st.markdown("### 🆕 New Customers")
-        st.caption("Recently onboarded, still building loyalty.")
-    with col3:
-        st.markdown("### ⚠️ At-Risk")
-        st.caption("Signals suggest higher churn probability.")
-
-    col4, col5 = st.columns(2)
-    with col4:
-        st.markdown("### 💎 Premium Service Users")
-        st.caption("High engagement across add-on services.")
-
     st.stop()
 
-
-# ============================================================
-# Process Uploaded File
-# ============================================================
 try:
     raw_df = load_uploaded_file(uploaded_file)
 except Exception as e:
     st.error(f"Could not read the uploaded file: {e}")
     st.stop()
 
-raw_df = clean_column_names(raw_df)
-missing_cols = validate_columns(raw_df)
+st.success(f"Loaded **{uploaded_file.name}** — {raw_df.shape[0]:,} rows × {raw_df.shape[1]} columns")
 
-if missing_cols:
-    st.error(
-        "The uploaded file is missing the following required columns:\n\n" +
-        "\n".join(f"- `{c}`" for c in missing_cols)
-    )
-    st.dataframe(raw_df.head())
+with st.expander("🔍 Preview raw data", expanded=False):
+    st.dataframe(raw_df.head(20), use_container_width=True)
+
+# ============================================================
+# Profiling & Cleaning
+# ============================================================
+numeric_cols, categorical_cols, excluded_cols = profile_dataframe(raw_df)
+
+if not numeric_cols and not categorical_cols:
+    st.error("No usable columns were detected for clustering. Please check your file.")
     st.stop()
 
+cleaned_df, fill_report = clean_dataframe(raw_df, numeric_cols, categorical_cols)
+
+with st.expander("🧹 Data Cleaning & Preprocessing Report", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Numeric columns (scaled)**")
+        st.write(numeric_cols if numeric_cols else "None detected")
+        st.markdown("**Categorical columns (one-hot encoded)**")
+        st.write(categorical_cols if categorical_cols else "None detected")
+    with c2:
+        st.markdown("**Excluded columns**")
+        if excluded_cols:
+            for col, reason in excluded_cols:
+                st.write(f"- `{col}` — {reason}")
+        else:
+            st.write("None excluded")
+
+    st.markdown("**Missing values filled**")
+    if fill_report:
+        fill_df = pd.DataFrame(fill_report, columns=["Column", "Missing Values", "Filled With"])
+        st.dataframe(fill_df, use_container_width=True, hide_index=True)
+    else:
+        st.write("No missing values found.")
+
+# ============================================================
+# Build preprocessing pipeline & transform
+# ============================================================
+preprocessor = build_pipeline(numeric_cols, categorical_cols)
 try:
-    result_df = predict_segments(raw_df)
+    X = preprocessor.fit_transform(cleaned_df)
 except Exception as e:
-    st.error(f"Prediction failed: {e}")
+    st.error(f"Preprocessing failed: {e}")
     st.stop()
 
-st.success(f"✅ Segmented {len(result_df):,} customers successfully.")
+n_rows = X.shape[0]
 
 # ============================================================
-# KPI Row
+# Optimal K helper — Elbow + Silhouette across K
 # ============================================================
-k1, k2, k3, k4 = st.columns(4)
+st.markdown("---")
+st.markdown("### 🔎 Find the Right Number of Segments (K)")
 
-with k1:
-    st.metric("Total Customers", f"{len(result_df):,}")
-with k2:
-    st.metric("Avg Monthly Charges", f"₹{result_df['MonthlyCharges'].mean():,.2f}")
-with k3:
-    st.metric("Avg Tenure (Months)", f"{result_df['Tenure_Months'].mean():.1f}")
-with k4:
-    at_risk_pct = (result_df["Customer Segment"] == "⚠️ At-Risk Customers").mean() * 100
-    st.metric("At-Risk Share", f"{at_risk_pct:.1f}%")
+show_elbow = st.checkbox("Run Elbow Method & Silhouette-by-K analysis", value=False)
+
+if show_elbow:
+    max_k = min(10, max(3, n_rows // 20))
+    k_range = list(range(2, max_k + 1))
+
+    X_dense_full = X.toarray() if hasattr(X, "toarray") else X
+    if n_rows > SAMPLE_LIMIT_FOR_ELBOW:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(n_rows, size=SAMPLE_LIMIT_FOR_ELBOW, replace=False)
+        X_dense = X_dense_full[idx]
+        st.caption(f"Analysis computed on a random sample of {SAMPLE_LIMIT_FOR_ELBOW:,} rows for speed.")
+    else:
+        X_dense = X_dense_full
+
+    with st.spinner("Testing different values of K..."):
+        wcss, sil_by_k = run_elbow_analysis(hash(uploaded_file.name), X_dense, k_range)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_elbow = go.Figure()
+        fig_elbow.add_trace(go.Scatter(x=k_range, y=wcss, mode="lines+markers"))
+        fig_elbow.update_layout(
+            title="Elbow Method (WCSS vs K)",
+            xaxis_title="Number of Clusters (K)",
+            yaxis_title="Within-Cluster Sum of Squares"
+        )
+        st.plotly_chart(fig_elbow, use_container_width=True)
+
+    with col2:
+        fig_sil = go.Figure()
+        fig_sil.add_trace(go.Bar(x=k_range, y=sil_by_k))
+        fig_sil.update_layout(
+            title="Silhouette Score by K",
+            xaxis_title="Number of Clusters (K)",
+            yaxis_title="Silhouette Score"
+        )
+        st.plotly_chart(fig_sil, use_container_width=True)
+
+    best_k = k_range[int(np.argmax(sil_by_k))]
+    st.info(f"💡 Highest silhouette score in this scan is at **K = {best_k}**.")
+
+# ============================================================
+# K Selection & Run
+# ============================================================
+default_k = 4 if n_rows >= 4 else 2
+k = st.slider("Choose number of segments (K)", min_value=2, max_value=10, value=default_k)
+
+run_clicked = st.button("🚀 Run Segmentation", type="primary")
+
+if run_clicked:
+    with st.spinner("Fitting KMeans and scoring this run..."):
+        km_model, labels = run_clustering(X, k)
+        sil_score, was_sampled, sil_n = safe_silhouette(X, labels)
+
+    result_df = cleaned_df.copy()
+    result_df["Cluster"] = labels
+    result_df["Segment"] = result_df["Cluster"].apply(lambda i: f"Segment {i}")
+
+    st.session_state["result_df"] = result_df
+    st.session_state["km_model"] = km_model
+    st.session_state["preprocessor"] = preprocessor
+    st.session_state["silhouette"] = sil_score
+    st.session_state["sil_sampled"] = was_sampled
+    st.session_state["sil_n"] = sil_n
+    st.session_state["numeric_cols"] = numeric_cols
+    st.session_state["categorical_cols"] = categorical_cols
+    st.session_state["k_used"] = k
+
+# ============================================================
+# Results
+# ============================================================
+if "result_df" not in st.session_state:
+    st.info("Set K above and click **Run Segmentation** to see results.")
+    st.stop()
+
+result_df = st.session_state["result_df"]
+sil_score = st.session_state["silhouette"]
+was_sampled = st.session_state["sil_sampled"]
+sil_n = st.session_state["sil_n"]
+numeric_cols = st.session_state["numeric_cols"]
+categorical_cols = st.session_state["categorical_cols"]
+k_used = st.session_state["k_used"]
+
+color_map = {f"Segment {i}": SEGMENT_COLORS[i % len(SEGMENT_COLORS)] for i in range(k_used)}
 
 st.markdown("---")
+st.markdown("### ✅ Segmentation Results")
 
-# ============================================================
-# Tabs
-# ============================================================
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📊 Segment Overview", "💰 Revenue & Tenure", "🧾 Service Usage", "📥 Data & Export"]
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.metric("Customers Segmented", f"{len(result_df):,}")
+with k2:
+    st.metric("Segments (K)", k_used)
+with k3:
+    label = "Silhouette Score"
+    if was_sampled:
+        label += f" (sample n={sil_n:,})"
+    st.metric(label, f"{sil_score:.3f}")
+
+st.caption(
+    "This silhouette score is computed fresh for this dataset and this K — "
+    "it is **not** a stored/fixed value. Re-run with a different K or a different "
+    "file and it will update accordingly."
 )
 
-# ------------------------------------------------------------
-# Tab 1: Segment Overview
+tab1, tab2, tab3 = st.tabs(["📊 Segment Overview", "🧾 Feature Breakdown", "📥 Data & Export"])
+
 # ------------------------------------------------------------
 with tab1:
     col1, col2 = st.columns([1, 1.3])
+    seg_counts = result_df["Segment"].value_counts().reset_index()
+    seg_counts.columns = ["Segment", "Count"]
 
     with col1:
-        seg_counts = result_df["Customer Segment"].value_counts().reset_index()
-        seg_counts.columns = ["Segment", "Count"]
-
         fig_pie = px.pie(
-            seg_counts,
-            names="Segment",
-            values="Count",
-            color="Segment",
-            color_discrete_map=CLUSTER_COLORS,
-            hole=0.45,
-            title="Customer Segment Distribution"
+            seg_counts, names="Segment", values="Count",
+            color="Segment", color_discrete_map=color_map,
+            hole=0.45, title="Segment Distribution"
         )
         fig_pie.update_traces(textinfo="percent+label")
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with col2:
         fig_bar = px.bar(
-            seg_counts.sort_values("Count", ascending=True),
-            x="Count",
-            y="Segment",
-            color="Segment",
-            color_discrete_map=CLUSTER_COLORS,
-            orientation="h",
-            title="Customers per Segment",
-            text="Count"
+            seg_counts.sort_values("Count"), x="Count", y="Segment",
+            color="Segment", color_discrete_map=color_map,
+            orientation="h", title="Customers per Segment", text="Count"
         )
         fig_bar.update_layout(showlegend=False)
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    st.markdown("#### Segment Profile Summary")
-    profile = result_df.groupby("Customer Segment").agg(
-        Customers=("Customer Segment", "count"),
-        Avg_Tenure=("Tenure_Months", "mean"),
-        Avg_Monthly_Charges=("MonthlyCharges", "mean"),
-        Avg_Total_Charges=("TotalCharges", "mean"),
-        Senior_Citizen_Pct=("SeniorCitizen", "mean")
-    ).reset_index()
-    profile["Senior_Citizen_Pct"] = (profile["Senior_Citizen_Pct"] * 100).round(1)
-    profile["Avg_Tenure"] = profile["Avg_Tenure"].round(1)
-    profile["Avg_Monthly_Charges"] = profile["Avg_Monthly_Charges"].round(2)
-    profile["Avg_Total_Charges"] = profile["Avg_Total_Charges"].round(2)
-    st.dataframe(profile, use_container_width=True, hide_index=True)
+    if numeric_cols:
+        st.markdown("#### Segment Profile — Numeric Averages")
+        profile = result_df.groupby("Segment")[numeric_cols].mean().round(2)
+        profile.insert(0, "Customers", result_df["Segment"].value_counts())
+        st.dataframe(profile, use_container_width=True)
 
-# ------------------------------------------------------------
-# Tab 2: Revenue & Tenure
 # ------------------------------------------------------------
 with tab2:
-    col1, col2 = st.columns(2)
-
-    with col1:
+    if numeric_cols:
+        feature = st.selectbox("Numeric feature to compare across segments", numeric_cols)
         fig_box = px.box(
-            result_df,
-            x="Customer Segment",
-            y="MonthlyCharges",
-            color="Customer Segment",
-            color_discrete_map=CLUSTER_COLORS,
-            title="Monthly Charges by Segment"
+            result_df, x="Segment", y=feature,
+            color="Segment", color_discrete_map=color_map,
+            title=f"{feature} by Segment"
         )
         fig_box.update_layout(showlegend=False)
         st.plotly_chart(fig_box, use_container_width=True)
 
-    with col2:
-        fig_tenure = px.box(
-            result_df,
-            x="Customer Segment",
-            y="Tenure_Months",
-            color="Customer Segment",
-            color_discrete_map=CLUSTER_COLORS,
-            title="Tenure (Months) by Segment"
+    if categorical_cols:
+        cat_feature = st.selectbox("Categorical feature to compare across segments", categorical_cols)
+        fig_cat = px.histogram(
+            result_df, x=cat_feature,
+            color="Segment", color_discrete_map=color_map,
+            barmode="group", title=f"{cat_feature} by Segment"
         )
-        fig_tenure.update_layout(showlegend=False)
-        st.plotly_chart(fig_tenure, use_container_width=True)
+        st.plotly_chart(fig_cat, use_container_width=True)
 
-    fig_scatter = px.scatter(
-        result_df,
-        x="Tenure_Months",
-        y="MonthlyCharges",
-        color="Customer Segment",
-        color_discrete_map=CLUSTER_COLORS,
-        opacity=0.6,
-        title="Tenure vs Monthly Charges",
-        hover_data=["TotalCharges", "Contract"]
-    )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    if not numeric_cols and not categorical_cols:
+        st.write("No feature columns available to break down.")
 
-    fig_contract = px.histogram(
-        result_df,
-        x="Contract",
-        color="Customer Segment",
-        color_discrete_map=CLUSTER_COLORS,
-        barmode="group",
-        title="Contract Type by Segment"
-    )
-    st.plotly_chart(fig_contract, use_container_width=True)
-
-# ------------------------------------------------------------
-# Tab 3: Service Usage
 # ------------------------------------------------------------
 with tab3:
-    service_cols = [
-        "InternetService", "TechSupport", "OnlineSecurity",
-        "OnlineBackup", "DeviceProtection", "StreamingTV",
-        "StreamingMovies", "MultipleLines"
-    ]
-
-    selected_service = st.selectbox("Select a service to analyze", service_cols)
-
-    fig_service = px.histogram(
-        result_df,
-        x=selected_service,
-        color="Customer Segment",
-        color_discrete_map=CLUSTER_COLORS,
-        barmode="group",
-        title=f"{selected_service} Distribution by Segment"
-    )
-    st.plotly_chart(fig_service, use_container_width=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fig_payment = px.histogram(
-            result_df,
-            x="PaymentMethod",
-            color="Customer Segment",
-            color_discrete_map=CLUSTER_COLORS,
-            barmode="group",
-            title="Payment Method by Segment"
-        )
-        fig_payment.update_layout(xaxis_tickangle=-30)
-        st.plotly_chart(fig_payment, use_container_width=True)
-
-    with col2:
-        fig_paperless = px.histogram(
-            result_df,
-            x="PaperlessBilling",
-            color="Customer Segment",
-            color_discrete_map=CLUSTER_COLORS,
-            barmode="group",
-            title="Paperless Billing by Segment"
-        )
-        st.plotly_chart(fig_paperless, use_container_width=True)
-
-# ------------------------------------------------------------
-# Tab 4: Data & Export
-# ------------------------------------------------------------
-with tab4:
     st.markdown("#### Filter Segmented Data")
     segments_selected = st.multiselect(
         "Filter by segment",
-        options=list(CLUSTER_MAP.values()),
-        default=list(CLUSTER_MAP.values())
+        options=sorted(result_df["Segment"].unique()),
+        default=sorted(result_df["Segment"].unique())
     )
-
-    filtered_df = result_df[result_df["Customer Segment"].isin(segments_selected)]
+    filtered_df = result_df[result_df["Segment"].isin(segments_selected)]
     st.dataframe(filtered_df, use_container_width=True, height=400)
 
-    csv_data = convert_df_to_csv(filtered_df)
+    csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="⬇️ Download Segmented Data (CSV)",
-        data=csv_data,
-        file_name="Segmented_BSNL_Customers.csv",
+        "⬇️ Download Segmented Data (CSV)",
+        data=csv_bytes,
+        file_name="segmented_customers.csv",
         mime="text/csv"
     )
 
-    st.markdown("---")
-    st.caption(
-        "Segmentation generated using a pre-trained KMeans model (k=4) with a "
-        "StandardScaler + OneHotEncoder preprocessing pipeline."
+    st.markdown("#### Download Trained Model")
+    st.caption("Bundles the preprocessing pipeline and the fitted KMeans model for this run.")
+    model_buffer = io.BytesIO()
+    joblib.dump(
+        {"preprocessor": st.session_state["preprocessor"], "kmeans": st.session_state["km_model"]},
+        model_buffer
+    )
+    st.download_button(
+        "⬇️ Download Model Bundle (.pkl)",
+        data=model_buffer.getvalue(),
+        file_name="segmentation_model.pkl",
+        mime="application/octet-stream"
     )
