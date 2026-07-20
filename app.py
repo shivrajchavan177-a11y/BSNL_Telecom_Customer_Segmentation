@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 # Page Config
 # ============================================================
 st.set_page_config(
-    page_title="BSNL Customer Segmentation Dashboard",
+    page_title="BSNL Customer Segmentation",
     page_icon="📡",
     layout="wide",
     initial_sidebar_state="expanded"
