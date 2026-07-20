@@ -1,5 +1,3 @@
-import io
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -29,6 +27,65 @@ SEGMENT_COLORS = [
 
 SAMPLE_LIMIT_FOR_SILHOUETTE = 5000   # silhouette_score is O(n^2), keep it fast on big data
 SAMPLE_LIMIT_FOR_ELBOW = 3000        # elbow re-fits KMeans many times, sample harder
+
+# Ordered low-value -> high-value naming palette. Whatever K the user picks (2-10),
+# we rank the resulting clusters by a composite "value" score and label them with
+# a suitable spread of these tiers instead of generic "Segment 0/1/2..." names.
+SEGMENT_TIERS = [
+    ("Low Value Customers",     "Low usage, low recharge, short tenure — highest churn risk"),
+    ("Budget Customers",        "Below-average usage and spend, price-sensitive"),
+    ("Regular Customers",       "Moderate usage, regular recharge, medium tenure"),
+    ("Growing Customers",       "Rising engagement, medium tenure, upsell potential"),
+    ("Steady Customers",        "Consistent moderate-to-high engagement"),
+    ("Engaged Customers",       "Above-average usage and recharge frequency"),
+    ("High Value Customers",    "High usage, high recharge, long tenure — loyal customers"),
+    ("Premium Customers",       "Very high usage and spend, strong tenure"),
+    ("VIP Customers",           "Top-tier engagement, spend and loyalty"),
+    ("Elite Customers",         "Highest value, longest tenure, most loyal customers"),
+]
+
+
+def get_segment_tiers(k):
+    """Pick k evenly-spread (name, description) tiers, ordered low -> high value."""
+    n_tiers = len(SEGMENT_TIERS)
+    if k > n_tiers:
+        # Shouldn't happen given the K slider is capped at 10, but stay safe.
+        return [SEGMENT_TIERS[i % n_tiers] for i in range(k)]
+    idxs = sorted(set(int(round(i)) for i in np.linspace(0, n_tiers - 1, k)))
+    i = 0
+    while len(idxs) < k:
+        if i not in idxs:
+            idxs.append(i)
+            idxs = sorted(idxs)
+        i += 1
+    return [SEGMENT_TIERS[i] for i in idxs]
+
+
+def name_clusters(cleaned_df, numeric_cols, labels, k):
+    """
+    Rank clusters by a composite 'value' score (mean z-score across numeric
+    features) and map them to suitable business-style names, low -> high value.
+    Falls back to natural cluster order if there are no numeric columns to rank by.
+    Returns: cluster_to_name (dict), cluster_to_desc (dict), tier_order (list of names, low->high)
+    """
+    tiers = get_segment_tiers(k)
+    tier_order = [name for name, _ in tiers]
+
+    if numeric_cols:
+        z = (cleaned_df[numeric_cols] - cleaned_df[numeric_cols].mean()) / cleaned_df[numeric_cols].std(ddof=0).replace(0, 1)
+        composite = z.mean(axis=1)
+        cluster_score = pd.Series(composite.values).groupby(labels).mean()
+        ranked_clusters = cluster_score.sort_values().index.tolist()  # low value -> high value
+    else:
+        ranked_clusters = list(range(k))
+
+    cluster_to_name, cluster_to_desc = {}, {}
+    for rank, cluster_id in enumerate(ranked_clusters):
+        name, desc = tiers[rank]
+        cluster_to_name[cluster_id] = name
+        cluster_to_desc[cluster_id] = desc
+
+    return cluster_to_name, cluster_to_desc, tier_order
 
 
 # ============================================================
@@ -324,9 +381,13 @@ if run_clicked:
         km_model, labels = run_clustering(X, k)
         sil_score, was_sampled, sil_n = safe_silhouette(X, labels)
 
+    cluster_to_name, cluster_to_desc, tier_order = name_clusters(cleaned_df, numeric_cols, labels, k)
+
     result_df = cleaned_df.copy()
     result_df["Cluster"] = labels
-    result_df["Segment"] = result_df["Cluster"].apply(lambda i: f"Segment {i}")
+    result_df["Segment"] = result_df["Cluster"].map(cluster_to_name)
+
+    segment_desc_map = {cluster_to_name[c]: cluster_to_desc[c] for c in cluster_to_name}
 
     st.session_state["result_df"] = result_df
     st.session_state["km_model"] = km_model
@@ -337,6 +398,8 @@ if run_clicked:
     st.session_state["numeric_cols"] = numeric_cols
     st.session_state["categorical_cols"] = categorical_cols
     st.session_state["k_used"] = k
+    st.session_state["segment_desc_map"] = segment_desc_map
+    st.session_state["tier_order"] = tier_order
 
 # ============================================================
 # Results
@@ -352,8 +415,10 @@ sil_n = st.session_state["sil_n"]
 numeric_cols = st.session_state["numeric_cols"]
 categorical_cols = st.session_state["categorical_cols"]
 k_used = st.session_state["k_used"]
+segment_desc_map = st.session_state["segment_desc_map"]
+tier_order = st.session_state["tier_order"]
 
-color_map = {f"Segment {i}": SEGMENT_COLORS[i % len(SEGMENT_COLORS)] for i in range(k_used)}
+color_map = {name: SEGMENT_COLORS[i % len(SEGMENT_COLORS)] for i, name in enumerate(tier_order)}
 
 st.markdown("---")
 st.markdown("### ✅ Segmentation Results")
@@ -379,6 +444,13 @@ tab1, tab2, tab3 = st.tabs(["📊 Segment Overview", "🧾 Feature Breakdown", "
 
 # ------------------------------------------------------------
 with tab1:
+    st.markdown("#### Segment Guide")
+    guide_rows = [
+        {"Segment": name, "Description": segment_desc_map[name]}
+        for name in tier_order if name in segment_desc_map
+    ]
+    st.dataframe(pd.DataFrame(guide_rows), use_container_width=True, hide_index=True)
+
     col1, col2 = st.columns([1, 1.3])
     seg_counts = result_df["Segment"].value_counts().reset_index()
     seg_counts.columns = ["Segment", "Count"]
@@ -448,18 +520,4 @@ with tab3:
         data=csv_bytes,
         file_name="segmented_customers.csv",
         mime="text/csv"
-    )
-
-    st.markdown("#### Download Trained Model")
-    st.caption("Bundles the preprocessing pipeline and the fitted KMeans model for this run.")
-    model_buffer = io.BytesIO()
-    joblib.dump(
-        {"preprocessor": st.session_state["preprocessor"], "kmeans": st.session_state["km_model"]},
-        model_buffer
-    )
-    st.download_button(
-        "⬇️ Download Model Bundle (.pkl)",
-        data=model_buffer.getvalue(),
-        file_name="segmentation_model.pkl",
-        mime="application/octet-stream"
     )
