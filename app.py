@@ -272,7 +272,7 @@ except Exception as e:
 
 st.success(f"Loaded **{uploaded_file.name}** — {raw_df.shape[0]:,} rows × {raw_df.shape[1]} columns")
 
-with st.expander("🔍 Preview raw data", expanded=False):
+with st.expander("🔍 Preview raw data", expanded=True):
     st.dataframe(raw_df.head(20), use_container_width=True)
 
 # ============================================================
@@ -286,7 +286,7 @@ if not numeric_cols and not categorical_cols:
 
 cleaned_df, fill_report = clean_dataframe(raw_df, numeric_cols, categorical_cols)
 
-with st.expander("🧹 Data Cleaning & Preprocessing Report", expanded=True):
+with st.expander("🧹 Data Cleaning & Preprocessing Report", expanded=False):
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Numeric columns (scaled)**")
