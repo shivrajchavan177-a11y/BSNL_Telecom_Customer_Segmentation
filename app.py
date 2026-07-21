@@ -10,6 +10,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.pipeline import Pipeline
 from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
 
 # ============================================================
 # Page Config
@@ -248,6 +249,53 @@ def build_pipeline(numeric_cols, categorical_cols):
     )
 
 
+def analyze_feature_importance(cleaned_df, numeric_cols, categorical_cols, k, sample_limit=3000):
+    """
+    Fit a quick baseline KMeans on ALL candidate columns, then train a RandomForest
+    to predict the resulting cluster label. The RF's feature importances show which
+    columns actually drove the split vs which ones are just adding noise/dimensions.
+    Returns: importance_df (Column, Importance, Type), n_numeric_dims, n_categorical_dims, silhouette
+    """
+    df = cleaned_df
+    if len(df) > sample_limit:
+        df = df.sample(sample_limit, random_state=42)
+
+    pre = build_pipeline(numeric_cols, categorical_cols)
+    X = pre.fit_transform(df[numeric_cols + categorical_cols])
+    X = X.toarray() if hasattr(X, "toarray") else np.asarray(X)
+
+    km = KMeans(n_clusters=k, n_init=10, random_state=42).fit(X)
+    labels = km.labels_
+    sil = silhouette_score(X, labels) if len(set(labels)) > 1 else float("nan")
+
+    feat_names = list(numeric_cols)
+    n_numeric_dims = len(numeric_cols)
+    if categorical_cols:
+        cat_names = list(pre.named_transformers_["cat"].get_feature_names_out(categorical_cols))
+        feat_names += cat_names
+    n_categorical_dims = len(feat_names) - n_numeric_dims
+
+    rf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1).fit(X, labels)
+    imp = pd.Series(rf.feature_importances_, index=feat_names)
+
+    def base_col(f):
+        if f in numeric_cols:
+            return f
+        for c in categorical_cols:
+            if f.startswith(c + "_"):
+                return c
+        return f
+
+    agg = imp.groupby([base_col(f) for f in feat_names]).sum().sort_values(ascending=False)
+    col_type = {c: ("Numeric" if c in numeric_cols else "Categorical") for c in agg.index}
+    importance_df = pd.DataFrame({
+        "Column": agg.index,
+        "Importance": agg.values,
+        "Type": [col_type[c] for c in agg.index]
+    })
+    return importance_df, n_numeric_dims, n_categorical_dims, sil
+
+
 # ============================================================
 # Helpers — Clustering & Metrics
 # ============================================================
@@ -293,7 +341,8 @@ def run_clustering(X, k):
 def reset_results():
     for key in ["result_df", "km_model", "preprocessor", "silhouette", "sil_sampled",
                 "sil_n", "numeric_cols", "categorical_cols", "excluded_cols", "fill_report",
-                "k_used", "X", "segment_desc_map", "tier_order"]:
+                "k_used", "X", "segment_desc_map", "tier_order",
+                "importance_df", "importance_dims", "importance_sil"]:
         st.session_state.pop(key, None)
 
 
@@ -384,6 +433,77 @@ with st.expander("🧹 Data Cleaning & Preprocessing Report", expanded=False):
         st.dataframe(fill_df, use_container_width=True, hide_index=True)
     else:
         st.write("No missing values found.")
+
+# ============================================================
+# Feature Selection & Importance Check
+# ============================================================
+st.markdown("---")
+st.markdown("### 🎯 Choose Features & Check Their Importance")
+st.caption(
+    "Every categorical column gets one-hot encoded into several dimensions, which can "
+    "outnumber and drown out your numeric columns in the distance calculation KMeans uses. "
+    "Run the check below to see what's actually driving the clusters before committing to K."
+)
+
+fc1, fc2 = st.columns(2)
+with fc1:
+    sel_numeric_cols = st.multiselect(
+        "Numeric columns to use", options=numeric_cols, default=numeric_cols
+    )
+with fc2:
+    sel_categorical_cols = st.multiselect(
+        "Categorical columns to use", options=categorical_cols, default=categorical_cols
+    )
+
+if not sel_numeric_cols and not sel_categorical_cols:
+    st.error("Select at least one column to cluster on.")
+    st.stop()
+
+if st.button("🔎 Analyze Feature Importance"):
+    with st.spinner("Fitting a quick baseline model to rank feature importance..."):
+        probe_k = 4 if len(cleaned_df) >= 4 else 2
+        importance_df, n_num_dims, n_cat_dims, probe_sil = analyze_feature_importance(
+            cleaned_df, sel_numeric_cols, sel_categorical_cols, probe_k
+        )
+        st.session_state["importance_df"] = importance_df
+        st.session_state["importance_dims"] = (n_num_dims, n_cat_dims)
+        st.session_state["importance_sil"] = probe_sil
+
+if "importance_df" in st.session_state:
+    importance_df = st.session_state["importance_df"]
+    n_num_dims, n_cat_dims = st.session_state["importance_dims"]
+    probe_sil = st.session_state["importance_sil"]
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.metric("Numeric dimensions", n_num_dims)
+    with d2:
+        st.metric("Categorical dimensions (one-hot)", n_cat_dims)
+    with d3:
+        st.metric("Baseline silhouette (K=4 probe)", f"{probe_sil:.3f}" if not np.isnan(probe_sil) else "n/a")
+
+    if n_cat_dims > 3 * max(n_num_dims, 1):
+        st.warning(
+            f"Categorical one-hot columns ({n_cat_dims} dims) heavily outnumber your numeric "
+            f"columns ({n_num_dims} dims). Low-importance categoricals below are likely adding "
+            "noise rather than signal — consider dropping them from the multiselect above."
+        )
+
+    fig_imp = px.bar(
+        importance_df, x="Importance", y="Column", color="Type", orientation="h",
+        title="What actually drives the cluster split (higher = more important)"
+    )
+    fig_imp.update_layout(yaxis=dict(categoryorder="total ascending"), height=max(300, 28 * len(importance_df)))
+    st.plotly_chart(fig_imp, use_container_width=True)
+
+    mean_imp = importance_df["Importance"].mean()
+    low_imp_cols = importance_df.loc[importance_df["Importance"] < mean_imp, "Column"].tolist()
+    if low_imp_cols:
+        st.caption(
+            "Below-average importance (candidates to drop): " + ", ".join(f"`{c}`" for c in low_imp_cols)
+        )
+
+numeric_cols, categorical_cols = sel_numeric_cols, sel_categorical_cols
 
 # ============================================================
 # Build preprocessing pipeline & transform
