@@ -3,12 +3,15 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.pipeline import Pipeline
+from sklearn.decomposition import PCA
 
 # ============================================================
 # Page Config
@@ -86,6 +89,67 @@ def name_clusters(cleaned_df, numeric_cols, labels, k):
         cluster_to_desc[cluster_id] = desc
 
     return cluster_to_name, cluster_to_desc, tier_order
+
+
+def draw_confidence_ellipse(ax, x, y, n_std=2.2):
+    """Draw a tilted red ellipse around a cluster's points, sized to its actual spread."""
+    if len(x) < 3:
+        return
+    cov = np.cov(x, y)
+    if np.any(np.isnan(cov)):
+        return
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = eigvals.argsort()[::-1]
+    eigvals, eigvecs = eigvals[order], eigvecs[:, order]
+    angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+    width, height = 2 * n_std * np.sqrt(np.maximum(eigvals, 0))
+    ellipse = Ellipse(
+        (np.mean(x), np.mean(y)), width=width, height=height, angle=angle,
+        facecolor="none", edgecolor="darkred", linewidth=2, zorder=3
+    )
+    ax.add_patch(ellipse)
+
+
+def render_cluster_scatter(X, km_model, result_df, color_map):
+    """
+    Real 2D visualization of the clusters actually fitted on this dataset.
+    Reduces to 2D via PCA when there are more than 2 features, so the plot
+    reflects the true geometry KMeans clustered on (not a mocked-up example).
+    """
+    X = np.asarray(X)
+    if X.shape[1] > 2:
+        pca = PCA(n_components=2, random_state=42)
+        coords = pca.fit_transform(X)
+        centers = pca.transform(km_model.cluster_centers_)
+        xlabel, ylabel = "PCA Component 1", "PCA Component 2"
+    else:
+        coords = X
+        centers = km_model.cluster_centers_
+        xlabel, ylabel = "Feature 1", "Feature 2"
+
+    clusters = result_df["Cluster"].to_numpy()
+    segments = result_df["Segment"].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.8))
+    for cluster_id in sorted(result_df["Cluster"].unique()):
+        mask = clusters == cluster_id
+        seg_name = segments[mask][0]
+        color = color_map.get(seg_name, "#888888")
+        cx, cy = coords[mask, 0], coords[mask, 1]
+        ax.scatter(cx, cy, s=22, color=color, alpha=0.75, label=seg_name, edgecolors="none")
+        draw_confidence_ellipse(ax, cx, cy, n_std=2.2)
+        ax.scatter(
+            centers[cluster_id, 0], centers[cluster_id, 1],
+            marker="X", s=170, color="red", edgecolors="black", linewidths=1, zorder=4
+        )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title("Clustering")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False)
+    fig.tight_layout()
+    return fig
+
 
 
 # ============================================================
@@ -216,7 +280,8 @@ def run_clustering(X, k):
 # ============================================================
 def reset_results():
     for key in ["result_df", "km_model", "preprocessor", "silhouette", "sil_sampled",
-                "sil_n", "numeric_cols", "categorical_cols", "excluded_cols", "fill_report", "k_used"]:
+                "sil_n", "numeric_cols", "categorical_cols", "excluded_cols", "fill_report",
+                "k_used", "X", "segment_desc_map", "tier_order"]:
         st.session_state.pop(key, None)
 
 
@@ -392,6 +457,7 @@ if run_clicked:
     st.session_state["result_df"] = result_df
     st.session_state["km_model"] = km_model
     st.session_state["preprocessor"] = preprocessor
+    st.session_state["X"] = X
     st.session_state["silhouette"] = sil_score
     st.session_state["sil_sampled"] = was_sampled
     st.session_state["sil_n"] = sil_n
@@ -417,6 +483,8 @@ categorical_cols = st.session_state["categorical_cols"]
 k_used = st.session_state["k_used"]
 segment_desc_map = st.session_state["segment_desc_map"]
 tier_order = st.session_state["tier_order"]
+X_fitted = st.session_state["X"]
+km_model = st.session_state["km_model"]
 
 color_map = {name: SEGMENT_COLORS[i % len(SEGMENT_COLORS)] for i, name in enumerate(tier_order)}
 
@@ -450,6 +518,14 @@ with tab1:
         for name in tier_order if name in segment_desc_map
     ]
     st.dataframe(pd.DataFrame(guide_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Cluster Visualization")
+    st.caption(
+        "Real clusters from this run — X marks each segment's centroid, ellipses show its spread. "
+        + ("Reduced to 2D via PCA since the data has more than 2 features." if X_fitted.shape[1] > 2 else "")
+    )
+    cluster_fig = render_cluster_scatter(X_fitted, km_model, result_df, color_map)
+    st.pyplot(cluster_fig, use_container_width=True)
 
     col1, col2 = st.columns([1, 1.3])
     seg_counts = result_df["Segment"].value_counts().reset_index()
