@@ -3,8 +3,6 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
 
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -91,23 +89,21 @@ def name_clusters(cleaned_df, numeric_cols, labels, k):
     return cluster_to_name, cluster_to_desc, tier_order
 
 
-def draw_confidence_ellipse(ax, x, y, n_std=2.2):
-    """Draw a tilted red ellipse around a cluster's points, sized to its actual spread."""
+def ellipse_path_points(x, y, n_std=2.2, n_points=100):
+    """Return (xs, ys) tracing a tilted ellipse around a cluster's points, sized to its spread."""
     if len(x) < 3:
-        return
+        return None, None
     cov = np.cov(x, y)
     if np.any(np.isnan(cov)):
-        return
+        return None, None
     eigvals, eigvecs = np.linalg.eigh(cov)
     order = eigvals.argsort()[::-1]
     eigvals, eigvecs = eigvals[order], eigvecs[:, order]
-    angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
-    width, height = 2 * n_std * np.sqrt(np.maximum(eigvals, 0))
-    ellipse = Ellipse(
-        (np.mean(x), np.mean(y)), width=width, height=height, angle=angle,
-        facecolor="none", edgecolor="darkred", linewidth=2, zorder=3
-    )
-    ax.add_patch(ellipse)
+    a, b = n_std * np.sqrt(np.maximum(eigvals, 0))
+    t = np.linspace(0, 2 * np.pi, n_points)
+    circle = np.stack([a * np.cos(t), b * np.sin(t)])
+    ellipse = eigvecs @ circle
+    return ellipse[0] + np.mean(x), ellipse[1] + np.mean(y)
 
 
 def render_cluster_scatter(X, km_model, result_df, color_map):
@@ -130,24 +126,40 @@ def render_cluster_scatter(X, km_model, result_df, color_map):
     clusters = result_df["Cluster"].to_numpy()
     segments = result_df["Segment"].to_numpy()
 
-    fig, ax = plt.subplots(figsize=(7.5, 5.8))
+    fig = go.Figure()
     for cluster_id in sorted(result_df["Cluster"].unique()):
         mask = clusters == cluster_id
         seg_name = segments[mask][0]
         color = color_map.get(seg_name, "#888888")
         cx, cy = coords[mask, 0], coords[mask, 1]
-        ax.scatter(cx, cy, s=22, color=color, alpha=0.75, label=seg_name, edgecolors="none")
-        draw_confidence_ellipse(ax, cx, cy, n_std=2.2)
-        ax.scatter(
-            centers[cluster_id, 0], centers[cluster_id, 1],
-            marker="X", s=170, color="red", edgecolors="black", linewidths=1, zorder=4
-        )
 
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title("Clustering")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=False)
-    fig.tight_layout()
+        fig.add_trace(go.Scatter(
+            x=cx, y=cy, mode="markers", name=seg_name,
+            marker=dict(size=6, color=color, opacity=0.75),
+            legendgroup=seg_name
+        ))
+
+        ex, ey = ellipse_path_points(cx, cy, n_std=2.2)
+        if ex is not None:
+            fig.add_trace(go.Scatter(
+                x=ex, y=ey, mode="lines", line=dict(color="darkred", width=2),
+                showlegend=False, hoverinfo="skip", legendgroup=seg_name
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=[centers[cluster_id, 0]], y=[centers[cluster_id, 1]], mode="markers",
+            marker=dict(symbol="x", size=14, color="red", line=dict(color="black", width=1)),
+            showlegend=False, hoverinfo="skip", legendgroup=seg_name
+        ))
+
+    fig.update_layout(
+        title="Clustering",
+        xaxis_title=xlabel,
+        yaxis_title=ylabel,
+        legend=dict(orientation="v"),
+        height=520,
+        margin=dict(t=50, b=40)
+    )
     return fig
 
 
@@ -525,7 +537,7 @@ with tab1:
         + ("Reduced to 2D via PCA since the data has more than 2 features." if X_fitted.shape[1] > 2 else "")
     )
     cluster_fig = render_cluster_scatter(X_fitted, km_model, result_df, color_map)
-    st.pyplot(cluster_fig, use_container_width=True)
+    st.plotly_chart(cluster_fig, use_container_width=True)
 
     col1, col2 = st.columns([1, 1.3])
     seg_counts = result_df["Segment"].value_counts().reset_index()
